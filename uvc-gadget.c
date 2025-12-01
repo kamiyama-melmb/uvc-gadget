@@ -32,6 +32,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <turbojpeg.h>
+
 #include <linux/usb/ch9.h>
 #include <linux/usb/video.h>
 #include <linux/videodev2.h>
@@ -439,6 +441,130 @@ static int v4l2_qbuf(struct v4l2_device *dev)
     return ret;
 }
 
+/* --- MJPEG デコード/描画/エンコード関数（libjpeg-turbo） --- */
+
+/* 単純 8x8 ビットマップフォント（'0'..'9' と 'x' と ' ' の簡易実装） */
+static const uint8_t digit_font8x8[10][8] = {
+    {0x3C,0x66,0x6E,0x7E,0x76,0x66,0x3C,0x00}, /*0*/
+    {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0x00}, /*1*/
+    {0x3C,0x66,0x06,0x0C,0x18,0x30,0x7E,0x00}, /*2*/
+    {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0x00}, /*3*/
+    {0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0x00}, /*4*/
+    {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0x00}, /*5*/
+    {0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0x00}, /*6*/
+    {0x7E,0x66,0x06,0x0C,0x18,0x18,0x18,0x00}, /*7*/
+    {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0x00}, /*8*/
+    {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0x00}, /*9*/
+};
+
+/* 1 文字（8x8）を RGB(3byte) バッファに白で描く。
+   rgbbuf は stride = width*3 を持つ画像 (top-left origin assumed) */
+static void draw_char_rgb(uint8_t *rgbbuf, int imgw, int imgh, int x0, int y0, char c)
+{
+    if (c == ' ') return;
+    const uint8_t *glyph = NULL;
+    uint8_t glyph_local[8] = {0};
+    if (c >= '0' && c <= '9') {
+        glyph = digit_font8x8[c - '0'];
+    } else if (c == 'x' || c == 'X') {
+        /* simple x glyph */
+        uint8_t xglyph[8] = {0x00,0x66,0x3C,0x18,0x3C,0x66,0x00,0x00};
+        memcpy(glyph_local, xglyph, 8);
+        glyph = glyph_local;
+    } else {
+        return;
+    }
+    int gw = 8, gh = 8;
+    for (int ry = 0; ry < gh; ++ry) {
+        uint8_t row = glyph[ry];
+        int y = y0 + ry;
+        if (y < 0 || y >= imgh) continue;
+        uint8_t *prow = rgbbuf + y * imgw * 3;
+        for (int rx = 0; rx < gw; ++rx) {
+            if (row & (1 << (7 - rx))) {
+                int x = x0 + rx;
+                if (x < 0 || x >= imgw) continue;
+                uint8_t *px = prow + x * 3;
+                /* 白: R=255,G=255,B=255 */
+                px[0] = 255; px[1] = 255; px[2] = 255;
+            }
+        }
+    }
+}
+
+/* 右下にテキストを描画（text は ASCII） */
+static void draw_text_rgb(uint8_t *rgbbuf, int imgw, int imgh, const char *text)
+{
+    int len = strlen(text);
+    if (len <= 0) return;
+    int charw = 8, charh = 8;
+    int margin = 4;
+    int totalw = len * charw;
+    int x0 = imgw - totalw - margin;
+    int y0 = imgh - charh - margin;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    for (int i = 0; i < len; ++i) {
+        draw_char_rgb(rgbbuf, imgw, imgh, x0 + i * charw, y0, text[i]);
+    }
+}
+
+/* MJPEG バッファをデコード→描画→再エンコード.
+   in_buf/in_size: 入力 JPEG データ
+   out_buf/out_size: 成功時に新しいJPEGデータを in-place 上書きして out_size を返す。
+   戻り値: 0=成功(上書き済み)、1=再圧縮サイズ大きくてスキップ、負=エラー
+   ※ この実装は「再圧縮サイズ <= orig_buf_cap」（呼び出し側が提供するmem[].length）なら
+      mem に上書きして true を返す。超える場合は元バッファを保持して描画スキップする。
+*/
+static int process_mjpeg_overlay_inplace(uint8_t *buf, unsigned int buf_cap, unsigned int in_size,
+                                         unsigned int imgw, unsigned int imgh, const char *text, unsigned int *out_size)
+{
+    int ret = -1;
+    tjhandle tjd = NULL, tjc = NULL;
+    unsigned char *rgbbuf = NULL;
+    unsigned long jpegSizeOut = 0;
+    unsigned char *jpegBufOut = NULL;
+
+    /* Decompress JPEG -> RGB */
+    tjd = tjInitDecompress();
+    if (!tjd) goto cleanup;
+    int w, h, jpegSubsamp, jpegColorspace;
+    if (tjDecompressHeader3(tjd, buf, in_size, &w, &h, &jpegSubsamp, &jpegColorspace) != 0) goto cleanup;
+    /* w/h が期待と違ったら続行するが注意 */
+    rgbbuf = malloc(w * h * 3);
+    if (!rgbbuf) goto cleanup;
+    if (tjDecompress2(tjd, buf, in_size, rgbbuf, w, 0 /*pitch*/, h, TJPF_RGB, TJFLAG_FASTDCT) != 0) goto cleanup;
+
+    /* 描画 */
+    draw_text_rgb(rgbbuf, w, h, text);
+
+    /* Recompress RGB -> MJPEG
+       画質 (quality) は 85 を例にする。品質/サイズは調整可能。*/
+    tjc = tjInitCompress();
+    if (!tjc) goto cleanup;
+    int quality = 85;
+    if (tjCompress2(tjc, rgbbuf, w, 0 /*pitch*/, h, TJPF_RGB,
+                    &jpegBufOut, &jpegSizeOut, jpegSubsamp, quality, TJFLAG_FASTDCT) != 0)
+        goto cleanup;
+
+    /* 容量チェック: 再圧縮サイズが元バッファ容量 buf_cap を超えていないか */
+    if (jpegSizeOut <= buf_cap) {
+        memcpy(buf, jpegBufOut, jpegSizeOut);
+        *out_size = (unsigned int)jpegSizeOut;
+        ret = 0; /* 成功・上書き */
+    } else {
+        /* 大きすぎる => スキップ */
+        ret = 1;
+    }
+
+cleanup:
+    if (tjd) tjDestroy(tjd);
+    if (tjc) tjDestroy(tjc);
+    if (rgbbuf) free(rgbbuf);
+    if (jpegBufOut) tjFree(jpegBufOut);
+    return ret < 0 ? -1 : ret;
+}
+
 static int v4l2_process_data(struct v4l2_device *dev)
 {
     int ret;
@@ -478,6 +604,27 @@ static int v4l2_process_data(struct v4l2_device *dev)
 #ifdef ENABLE_BUFFER_DEBUG
     printf("Dequeueing buffer at V4L2 side = %d\n", vbuf.index);
 #endif
+
+    /* MJPEG の場合は右下に解像度テキストを描画して再圧縮（インプレース） */
+    if (dev->udev && dev->udev->fcc == V4L2_PIX_FMT_MJPEG) {
+        unsigned int newsize = 0;
+        /* 元バッファ容量として dev->mem[vbuf.index].length を使う */
+        uint8_t *bufptr = (uint8_t *)dev->mem[vbuf.index].start;
+        unsigned int bufcap = dev->mem[vbuf.index].length;
+        char textbuf[64];
+        snprintf(textbuf, sizeof(textbuf), "%ux%u", dev->udev->width, dev->udev->height);
+        int pres = process_mjpeg_overlay_inplace(bufptr, bufcap, vbuf.bytesused, dev->udev->width, dev->udev->height,
+                                                 textbuf, &newsize);
+        if (pres == 0) {
+            /* 上書き成功なら bytesused を更新 */
+            vbuf.bytesused = newsize;
+        } else if (pres == 1) {
+            /* 再圧縮サイズが大きすぎてスキップした場合は何もしない（元データを送る）*/
+        } else {
+            /* エラー時はログを出す */
+            printf("MJPEG overlay: processing error\n");
+        }
+    }
 
     /* Queue video buffer to UVC domain. */
     CLEAR(ubuf);
